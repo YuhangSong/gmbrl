@@ -2,6 +2,8 @@ import argparse
 import os
 import sys
 from six.moves import shlex_quote
+import config
+import subprocess
 
 parser = argparse.ArgumentParser(description="Run commands")
 parser.add_argument('-w', '--num-workers', default=1, type=int,
@@ -11,7 +13,7 @@ parser.add_argument('-r', '--remotes', default=None,
                          'rewarders to use (e.g. -r vnc://localhost:5900+15900,vnc://localhost:5901+15901).')
 parser.add_argument('-e', '--env-id', type=str, default="PongDeterministic-v3",
                     help="Environment id")
-parser.add_argument('-l', '--log-dir', type=str, default="../../result/grl_1/pong_1",
+parser.add_argument('-l', '--log-dir', type=str, default=config.logdir,
                     help="Log directory path")
 parser.add_argument('-n', '--dry-run', action='store_true',
                     help="Print out commands rather than executing them")
@@ -37,7 +39,6 @@ def new_cmd(session, name, cmd, mode, logdir, shell):
 def create_commands(session, num_workers, remotes, env_id, logdir, shell='bash', mode='tmux', visualise=False):
     # for launching the TF workers and for launching tensorboard
     base_cmd = [
-        'CUDA_VISIBLE_DEVICES=',
         sys.executable, 'worker.py',
         '--log-dir', logdir,
         '--env-id', env_id,
@@ -57,9 +58,10 @@ def create_commands(session, num_workers, remotes, env_id, logdir, shell='bash',
         cmds_map += [new_cmd(session,
             "w-%d" % i, base_cmd + ["--job-name", "worker", "--task", str(i), "--remotes", remotes[i]], mode, logdir, shell)]
 
-    cmds_map += [new_cmd(session, "tb", ["tensorboard", "--logdir", logdir, "--port", "12345"], mode, logdir, shell)]
-    if mode == 'tmux':
-        cmds_map += [new_cmd(session, "htop", ["htop"], mode, logdir, shell)]
+    '''cmd for worker that trains gan'''
+    cmds_map += [new_cmd(session, "gan", [sys.executable, 'worker_train_gan.py'], mode, logdir, shell)]
+
+    cmds_map += [new_cmd(session, "tb", [str(sys.executable).split('python')[0]+"tensorboard", "--logdir", logdir, "--port", "12345"], mode, logdir, shell)]
 
     windows = [v[0] for v in cmds_map]
 
@@ -93,8 +95,13 @@ def create_commands(session, num_workers, remotes, env_id, logdir, shell='bash',
 
     return cmds, notes
 
+def prepare_dir():
+    subprocess.call(["mkdir", "-p", config.logdir])
+    subprocess.call(["mkdir", "-p", config.modeldir])
+    subprocess.call(["mkdir", "-p", config.datadir])
 
 def run():
+    prepare_dir()
     args = parser.parse_args()
     cmds, notes = create_commands("a3c", args.num_workers, args.remotes, args.env_id, args.log_dir, mode=args.mode, visualise=args.visualise)
     if args.dry_run:

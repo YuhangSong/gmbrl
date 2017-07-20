@@ -1,12 +1,37 @@
 from __future__ import print_function
+import torch
+import torch.nn as nn
+import torch.nn.parallel
+import torch.backends.cudnn as cudnn
+import torch.optim as optim
+import torch.utils.data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+import torchvision.utils as vutils
+from torch.autograd import Variable
 from collections import namedtuple
 import numpy as np
+import go_vncdriver
 import tensorflow as tf
 from model import LSTMPolicy
 import six.moves.queue as queue
 import scipy.signal
 import threading
 import distutils.version
+import config
+import globalvar as GlobalVar
+import argparse
+import random
+import os
+import copy
+import wgan_models.dcgan as dcgan
+import wgan_models.mlp as mlp
+import support_lib
+import config
+import subprocess
+import time
+import multiprocessing
+import gan
 use_tf12_api = distutils.version.LooseVersion(tf.VERSION) >= distutils.version.LooseVersion('0.12.0')
 
 def discount(x, gamma):
@@ -14,8 +39,8 @@ def discount(x, gamma):
 
 def process_rollout(rollout, gamma, lambda_=1.0):
     """
-given a rollout, compute its returns and the advantage
-"""
+    given a rollout, compute its returns and the advantage
+    """
     batch_si = np.asarray(rollout.states)
     batch_a = np.asarray(rollout.actions)
     rewards = np.asarray(rollout.rewards)
@@ -35,9 +60,9 @@ Batch = namedtuple("Batch", ["si", "a", "adv", "r", "terminal", "features"])
 
 class PartialRollout(object):
     """
-a piece of a complete rollout.  We run our agent, and process its experience
-once it has processed enough steps.
-"""
+    a piece of a complete rollout.  We run our agent, and process its experience
+    once it has processed enough steps.
+    """
     def __init__(self):
         self.states = []
         self.actions = []
@@ -67,11 +92,11 @@ once it has processed enough steps.
 
 class RunnerThread(threading.Thread):
     """
-One of the key distinctions between a normal environment and a universe environment
-is that a universe environment is _real time_.  This means that there should be a thread
-that would constantly interact with the environment and tell it what to do.  This thread is here.
-"""
-    def __init__(self, env, policy, num_local_steps, visualise):
+    One of the key distinctions between a normal environment and a universe environment
+    is that a universe environment is _real time_.  This means that there should be a thread
+    that would constantly interact with the environment and tell it what to do.  This thread is here.
+    """
+    def __init__(self, env, policy, num_local_steps, visualise, gan_runner):
         threading.Thread.__init__(self)
         self.queue = queue.Queue(5)
         self.num_local_steps = num_local_steps
@@ -82,6 +107,7 @@ that would constantly interact with the environment and tell it what to do.  Thi
         self.sess = None
         self.summary_writer = None
         self.visualise = visualise
+        self.gan_runner = gan_runner
 
     def start_runner(self, sess, summary_writer):
         self.sess = sess
@@ -93,7 +119,7 @@ that would constantly interact with the environment and tell it what to do.  Thi
             self._run()
 
     def _run(self):
-        rollout_provider = env_runner(self.env, self.policy, self.num_local_steps, self.summary_writer, self.visualise)
+        rollout_provider = env_runner(self.env, self.policy, self.num_local_steps, self.summary_writer, self.visualise, self.gan_runner)
         while True:
             # the timeout variable exists because apparently, if one worker dies, the other workers
             # won't die with it, unless the timeout is set to some large number.  This is an empirical
@@ -101,16 +127,81 @@ that would constantly interact with the environment and tell it what to do.  Thi
 
             self.queue.put(next(rollout_provider), timeout=600.0)
 
-
-
-def env_runner(env, policy, num_local_steps, summary_writer, render):
+class GanRunnerThread(threading.Thread):
     """
-The logic of the thread runner.  In brief, it constantly keeps on running
-the policy, and as long as the rollout exceeds a certain length, the thread
-runner appends the policy to the queue.
-"""
-    last_state = env.reset()
+    This thread runs gan training
+    """
+    def __init__(self):
+        threading.Thread.__init__(self)
+        
+        '''create gan'''
+        self.gan = gan.gan()
+
+        '''dataset intialize'''
+        self.reset_dateset()
+
+        '''bootstrap'''
+        np.savez(config.datadir+'data.npz',
+                 data=self.dataset)
+
+
+    def push_data(self, data):
+        self.dataset = np.concatenate((self.dataset,data),
+                                      axis=0)
+
+    def save_dataset(self):
+
+        '''Try saving data'''
+        try:
+            previous_data = np.load(config.datadir+'data.npz')['data'] # load data
+            print('Previous data found: '+str(np.shape(previous_data)))
+            self.push_data(previous_data)
+
+            '''
+            cat data to recent, this is only for similated env
+            since the env is so fast
+            '''
+            self.dataset=self.dataset[np.shape(self.dataset)[0]-config.gan_recent_dataset:np.shape(self.dataset)[0]]
+
+            print('Save data: '+str(np.shape(self.dataset)))
+            np.savez(config.datadir+'data.npz',
+                     data=self.dataset)
+            self.reset_dateset()
+        except Exception, e:
+            print(str(Exception)+": "+str(e))
+
+    def reset_dateset(self):
+        self.dataset = self.gan.empty_dataset_with_aux
+
+    def run(self):
+
+        while True:
+            self.save_dataset()
+            self.gan.load_models()
+            time.sleep(config.gan_worker_com_internal)
+
+def rbg2gray(rgb):
+    gray = rgb[0]*0.299 + rgb[1]*0.587 + rgb[2]*0.114  # Gray = R*0.299 + G*0.587 + B*0.114
+    gray = np.expand_dims(gray,2)
+    return gray
+
+def env_runner(env, policy, num_local_steps, summary_writer, render, gan_runner):
+    """
+    The logic of the thread runner.  In brief, it constantly keeps on running
+    the policy, and as long as the rollout exceeds a certain length, the thread
+    runner appends the policy to the queue.
+    """
+
+    '''create image recorder'''
+    lllast_image = None
+    llast_image = None
+    last_image = None
+    image = None
+
+    last_image = env.reset()
+    last_state = rbg2gray(last_image)
     last_features = policy.get_initial_features()
+    fetched = policy.act(last_state, *last_features)
     length = 0
     rewards = 0
 
@@ -119,10 +210,45 @@ runner appends the policy to the queue.
         rollout = PartialRollout()
 
         for _ in range(num_local_steps):
-            fetched = policy.act(last_state, *last_features)
-            action, value_, features = fetched[0], fetched[1], fetched[2:]
+
+            if config.agent_acting:
+                '''act from model'''
+                fetched = policy.act(last_state, *last_features)
+                action, value_, features = fetched[0], fetched[1], fetched[2:]
+            else:
+                '''genrate random action'''
+                action_ = np.random.randint(0, 
+                                            high=config.action_space-1,
+                                            size=None)
+                action = np.zeros((config.action_space))
+                action[action_] = 1.0
+                value_ = 0.0
+                features = np.zeros((2,1,256))
+
+            if config.overwirite_with_grid:
+                GlobalVar.set_mq_client(action.argmax())
+                
             # argmax to convert from one-hot
-            state, reward, terminal, info = env.step(action.argmax())
+            image, reward, terminal, info = env.step(action.argmax())
+
+            if last_image is None or llast_image is None or lllast_image is None:
+                pass
+            else:
+                aux = np.zeros(np.shape(image))
+                aux[0:1,0:1,0:1] = (1.0*action.argmax()) / config.action_space
+                data = [lllast_image,llast_image,last_image,image,aux]
+                data = np.asarray(data)
+                gan_runner.push_data(np.expand_dims(data,0))
+
+            lllast_image = copy.deepcopy(llast_image)
+            llast_image = copy.deepcopy(last_image)
+            last_image = copy.deepcopy(image)
+
+            
+            state = rbg2gray(image)
+
+            # gan_runner.push_data(state_rgb)
+
             if render:
                 env.render()
 
@@ -138,22 +264,28 @@ runner appends the policy to the queue.
                 summary = tf.Summary()
                 for k, v in info.items():
                     summary.value.add(tag=k, simple_value=float(v))
-                summary_writer.add_summary(summary, policy.global_step.eval())
-                summary_writer.flush()
-
-            timestep_limit = env.spec.tags.get('wrapper_config.TimeLimit.max_episode_steps')
-            if terminal or length >= timestep_limit:
+                if config.agent_acting:
+                    summary_writer.add_summary(summary, policy.global_step.eval())
+                    summary_writer.flush()
+            
+            if terminal:
                 terminal_end = True
-                if length >= timestep_limit or not env.metadata.get('semantics.autoreset'):
-                    last_state = env.reset()
                 last_features = policy.get_initial_features()
                 print("Episode finished. Sum of rewards: %d. Length: %d" % (rewards, length))
                 length = 0
                 rewards = 0
+                '''reset image recorder'''
+                lllast_image = None
+                llast_image = None
+                last_image = None
+                image = None
                 break
 
         if not terminal_end:
-            rollout.r = policy.value(last_state, *last_features)
+            if config.agent_acting:
+                rollout.r = policy.value(last_state, *last_features)
+            else:
+                rollout.r = 0.0
 
         # once we have enough experience, yield it, and have the ThreadRunner place it on a queue
         yield rollout
@@ -161,15 +293,23 @@ runner appends the policy to the queue.
 class A3C(object):
     def __init__(self, env, task, visualise):
         """
-An implementation of the A3C algorithm that is reasonably well-tuned for the VNC environments.
-Below, we will have a modest amount of complexity due to the way TensorFlow handles data parallelism.
-But overall, we'll define the model, specify its inputs, and describe how the policy gradients step
-should be computed.
-"""
+        An implementation of the A3C algorithm that is reasonably well-tuned for the VNC environments.
+        Below, we will have a modest amount of complexity due to the way TensorFlow handles data parallelism.
+        But overall, we'll define the model, specify its inputs, and describe how the policy gradients step
+        should be computed.
+        """
 
         self.env = env
         self.task = task
-        worker_device = "/job:worker/task:{}/cpu:0".format(task)
+
+        '''create gan_runner'''
+        self.gan_runner = GanRunnerThread()
+
+        ######################################################################
+        ############################## A3C Model #############################
+        ######################################################################
+
+        worker_device = "/job:worker/task:{}".format(task)
         with tf.device(tf.train.replica_device_setter(1, worker_device=worker_device)):
             with tf.variable_scope("global"):
                 self.network = LSTMPolicy(env.observation_space.shape, env.action_space.n)
@@ -206,7 +346,7 @@ should be computed.
             # on the one hand;  but on the other hand, we get less frequent parameter updates, which
             # slows down learning.  In this code, we found that making local steps be much
             # smaller than 20 makes the algorithm more difficult to tune and to get to work.
-            self.runner = RunnerThread(env, pi, 20, visualise)
+            self.runner = RunnerThread(env, pi, 20, visualise, self.gan_runner)
 
 
             grads = tf.gradients(self.loss, pi.var_list)
@@ -235,22 +375,25 @@ should be computed.
             self.sync = tf.group(*[v1.assign(v2) for v1, v2 in zip(pi.var_list, self.network.var_list)])
 
             grads_and_vars = list(zip(grads, self.network.var_list))
-            inc_step = self.global_step.assign_add(tf.shape(pi.x)[0])
+            self.inc_step = self.global_step.assign_add(tf.shape(pi.x)[0])
 
             # each worker has a different set of adam optimizer parameters
             opt = tf.train.AdamOptimizer(1e-4)
-            self.train_op = tf.group(opt.apply_gradients(grads_and_vars), inc_step)
+            self.train_op = tf.group(opt.apply_gradients(grads_and_vars))
             self.summary_writer = None
             self.local_steps = 0
 
+        ######################################################################
+
     def start(self, sess, summary_writer):
         self.runner.start_runner(sess, summary_writer)
+        self.gan_runner.start()
         self.summary_writer = summary_writer
 
     def pull_batch_from_queue(self):
         """
-self explanatory:  take a rollout from the queue of the thread runner.
-"""
+        self explanatory:  take a rollout from the queue of the thread runner.
+        """
         rollout = self.runner.queue.get(timeout=600.0)
         while not rollout.terminal:
             try:
@@ -261,10 +404,10 @@ self explanatory:  take a rollout from the queue of the thread runner.
 
     def process(self, sess):
         """
-process grabs a rollout that's been produced by the thread runner,
-and updates the parameters.  The update is then sent to the parameter
-server.
-"""
+        process grabs a rollout that's been produced by the thread runner,
+        and updates the parameters.  The update is then sent to the parameter
+        server.
+        """
 
         sess.run(self.sync)  # copy weights from shared to local
         rollout = self.pull_batch_from_queue()
@@ -273,9 +416,14 @@ server.
         should_compute_summary = self.task == 0 and self.local_steps % 11 == 0
 
         if should_compute_summary:
-            fetches = [self.summary_op, self.train_op, self.global_step]
+            fetches = [self.summary_op, self.global_step]
         else:
-            fetches = [self.train_op, self.global_step]
+            fetches = [self.global_step]
+
+        fetches += [self.inc_step]
+
+        if config.agent_learning:
+            fetches += [self.train_op]
 
         feed_dict = {
             self.local_network.x: batch.si,
@@ -289,6 +437,6 @@ server.
         fetched = sess.run(fetches, feed_dict=feed_dict)
 
         if should_compute_summary:
-            self.summary_writer.add_summary(tf.Summary.FromString(fetched[0]), fetched[-1])
+            self.summary_writer.add_summary(tf.Summary.FromString(fetched[0]), fetched[1])
             self.summary_writer.flush()
         self.local_steps += 1
